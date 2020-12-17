@@ -50,3 +50,8 @@ static __device__ float l2_float4 (float4 a) {
              pow2 (a.z));
 
 }
+static __device__ float pixel_distance(float2 p1, float2 p2) {
+    return sqrtf( pow2(p1.x-p2.x) +
+                  pow2(p1.y-p2.y));
+
+}

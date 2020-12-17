@@ -63,6 +63,17 @@ __device__ FORCEINLINE void get3Dpoint_cu ( float4 * __restrict__ ptX, const Cam
 
     matvecmul4 (cam.M_inv, pt, ptX);
 }
+
+__device__ FORCEINLINE void get3Dpoint_cu ( float4 * __restrict__ ptX, const Camera_cu &cam, const float2 &p, const float &depth ) { //qiyh for reproj_pt
+    // in case camera matrix is not normalized: see page 162, then depth might not be the real depth but w and depth needs to be computed from that first
+    const float4 pt = make_float4 (
+                                   depth * (float)p.x     - cam.P_col34.x,
+                                   depth * (float)p.y     - cam.P_col34.y,
+                                   depth                  - cam.P_col34.z,
+                                   0);
+
+    matvecmul4 (cam.M_inv, pt, ptX);
+}
 __device__ FORCEINLINE void get3Dpoint_cu1 ( float4 * __restrict__ ptX, const Camera_cu &cam, const int2 &p) {
     // in case camera matrix is not normalized: see page 162, then depth might not be the real depth but w and depth needs to be computed from that first
     float4 pt;
@@ -131,6 +142,208 @@ __device__ FORCEINLINE void project_on_camera (const float4 &X, const Camera_cu 
     pt->y = tmp.y / tmp.z;
     *depth = tmp.z;
 }
+__device__ FORCEINLINE void project_on_camera (const float4 &X, const Camera_cu &cam, float2 *pt) {
+    float4 tmp = make_float4 (0, 0, 0, 0);
+    matvecmul4P (cam.P, X, (&tmp));
+    pt->x = tmp.x / tmp.z;
+    pt->y = tmp.y / tmp.z;
+    //*depth = tmp.z;
+}
+
+
+/*
+ * Simple and fast depth math fusion based on depth map and normal consensus
+ */
+__global__ void fusibile2333 (GlobalState &gs, int ref_camera)
+{
+    int2 p = make_int2 ( blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y );
+    //    printf("p is %d %d\n", p.x, p.y);
+
+    const int cols = gs.cameras->cols;
+    const int rows = gs.cameras->rows;
+
+    if (p.x>=cols)
+        return;
+    if (p.y>=rows)
+        return;
+
+    const int center = p.y*cols+p.x;
+
+    const CameraParameters_cu &camParams = *(gs.cameras);
+
+    if (gs.lines[ref_camera].used_pixels[center]==1)
+        return;
+
+    //printf("ref_camera is %d\n", ref_camera);
+    const float4 normal_and_depth = tex2D<float4> (gs.normals_depths[ref_camera], p.x+0.5f, p.y+0.5f);
+    //printf("Normal is %f %f %f\nDepth is %f\n", normal.x, normal.y, normal.z, normal.w);
+    /*
+     * For each point of the reference camera compute the 3d position corresponding to the corresponding depth.
+     * Create a point only if the following conditions are fulfilled:
+     * - Projected depths of other cameras does not differ more than gs.params.depthThresh
+     * - Angle of normal does not differ more than gs.params.normalThresh
+     */
+    float depth = normal_and_depth.w;
+
+    float4 X;
+    get3Dpoint_cu (&X, camParams.cameras[ref_camera], p, depth);
+    //if (p.x<100 && p.y ==100)
+    //printf("3d Point is %f %f %f\n", X.x, X.y, X.z);
+    float4 consistent_X = X;
+    float4 consistent_normal  = normal_and_depth;
+    float4 consistent_texture4 = tex2D<float4> (gs.imgs[ref_camera], p.x+0.5f, p.y+0.5f);
+    int number_consistent = 0;
+    //int2 used_list[camParams.viewSelectionSubsetNumber];
+    int2 used_list[MAX_IMAGES];
+    for ( int i = 0; i < camParams.viewSelectionSubsetNumber; i++ ) {
+
+        int idxCurr = camParams.viewSelectionSubset[i];
+        used_list[idxCurr].x=-1;
+        used_list[idxCurr].y=-1;
+        if (idxCurr == ref_camera)
+            continue;
+
+        // Project 3d point X on camera idxCurr
+        float2 tmp_pt;
+        project_on_camera (X, camParams.cameras[idxCurr], &tmp_pt);
+        //printf("P for camera %d is \n", i);
+        //print_matrix (camParams.cameras[idxCurr].P, "camera ");
+        //printf("2d point for camera %d is %f %f\n", idxCurr, tmp_pt.x, tmp_pt.y);
+//        printf("666");
+
+        // Boundary check
+        if (tmp_pt.x >=0 &&
+            tmp_pt.x < cols &&
+            tmp_pt.y >=0 &&
+            tmp_pt.y < rows) {
+            //printf("Boundary check passed\n");
+
+            // Compute interpolated depth and normal for tmp_pt w.r.t. camera ref_camera
+            float4 tmp_normal_and_depth; // first 3 components normal, fourth depth
+            tmp_normal_and_depth   = tex2D<float4> (gs.normals_depths[idxCurr], tmp_pt.x+0.5f, tmp_pt.y+0.5f);
+//            printf("New depth is %f vs %f\n", tmp_normal_and_depth.w, depth);
+            float tmp_depth = tmp_normal_and_depth.w;
+
+            // reproject bach to ref_cam
+            float4 tmp_X;
+            get3Dpoint_cu(&tmp_X, camParams.cameras[idxCurr], tmp_pt, tmp_depth);
+
+            float2 reproj_pt;
+            project_on_camera(tmp_X, camParams.cameras[ref_camera], &reproj_pt);
+
+            // Boundary check again
+            if (reproj_pt.x >= 0 &&
+                reproj_pt.x < cols &&
+                reproj_pt.y >= 0 &&
+                reproj_pt.y < rows) {
+
+                // compute interpolated depth and normal for reproj_pt
+                float4 reproj_normal_and_depth;
+                reproj_normal_and_depth = tex2D<float4> (gs.normals_depths[ref_camera], reproj_pt.x+0.5f, reproj_pt.y+0.5f);
+                float reproj_depth = reproj_normal_and_depth.w;
+
+//                if(fabsf(reproj_depth - depth)/depth < 0.01f) {//
+                if(fabsf(reproj_depth - depth)/depth < gs.params->depthThresh) {
+                    float2 pp;
+                    pp.x = float(p.x);
+                    pp.y = float(p.y);
+                    if(pixel_distance(reproj_pt, pp) < 1.0f) {
+                        consistent_X      = consistent_X      + tmp_X;
+                        //consistent_X      = tmp_X;
+                        consistent_normal = consistent_normal + tmp_normal_and_depth;
+                        if (gs.params->saveTexture)
+                            consistent_texture4 = consistent_texture4 + tex2D<float4> (gs.imgs[idxCurr], tmp_pt.x+0.5f, tmp_pt.y+0.5f);
+
+
+
+                        // Save the point for later check
+                        //printf ("Saved point on camera %d is %d %d\n", idxCurr, (int)tmp_pt.x, (int)tmp_pt.y);
+                        used_list[idxCurr].x=(int)tmp_pt.x;
+                        used_list[idxCurr].y=(int)tmp_pt.y;
+
+                        number_consistent++;
+
+                    }
+                }
+            }
+            else
+                continue;
+
+
+
+//            const float depth_disp = disparityDepthConversion_cu2                ( camParams.cameras[ref_camera].f, camParams.cameras[ref_camera], camParams.cameras[idxCurr], depth );
+//            const float tmp_normal_and_depth_disp = disparityDepthConversion_cu2 ( camParams.cameras[ref_camera].f, camParams.cameras[ref_camera], camParams.cameras[idxCurr], tmp_normal_and_depth.w );
+//            // First consistency check on depth
+//            if (fabsf(depth_disp - tmp_normal_and_depth_disp) < gs.params->depthThresh) {
+//                //printf("\tFirst consistency test passed!\n");
+//                float angle = getAngle_cu (tmp_normal_and_depth, normal_and_depth); // extract normal
+//                if (angle < gs.params->normalThresh)
+//                {
+//                    //printf("\tSecond consistency test passed!\n");
+//                    /// All conditions met:
+//                    //  - average 3d points and normals
+//                    //  - save resulting point and normal
+//                    //  - (optional) average texture (not done yet)
+//                    float4 tmp_X; // 3d point of consistent point on other view
+//                    int2 tmp_p = make_int2 ((int) tmp_pt.x, (int) tmp_pt.y);
+
+//                    get3Dpoint_cu (&tmp_X, camParams.cameras[idxCurr], tmp_p, tmp_normal_and_depth.w);
+//                    consistent_X      = consistent_X      + tmp_X;
+//                    //consistent_X      = tmp_X;
+//                    consistent_normal = consistent_normal + tmp_normal_and_depth;
+//                    if (gs.params->saveTexture)
+//                        consistent_texture4 = consistent_texture4 + tex2D<float4> (gs.imgs[idxCurr], tmp_pt.x+0.5f, tmp_pt.y+0.5f);
+
+
+
+//                    // Save the point for later check
+//                    //printf ("Saved point on camera %d is %d %d\n", idxCurr, (int)tmp_pt.x, (int)tmp_pt.y);
+//                    used_list[idxCurr].x=(int)tmp_pt.x;
+//                    used_list[idxCurr].y=(int)tmp_pt.y;
+
+//                    number_consistent++;
+//                }
+//            }
+        }
+        else
+            continue;
+    }
+
+    // Average normals and points
+    consistent_X       = consistent_X       / ((float) number_consistent + 1.0f);
+    consistent_normal  = consistent_normal  / ((float) number_consistent + 1.0f);
+    consistent_texture4 = consistent_texture4 / ((float) number_consistent + 1.0f);
+
+    // If at least numConsistentThresh point agree:
+    // Create point
+    // Save normal
+    // (optional) save texture
+    if (number_consistent >= gs.params->numConsistentThresh) {
+        //printf("\tEnough consistent points!\nSaving point %f %f %f", consistent_X.x, consistent_X.y, consistent_X.z);
+        if (!gs.params->remove_black_background) // hardcoded for middlebury TODO FIX
+        {
+            gs.pc->points[center].coord  = consistent_X;
+            gs.pc->points[center].normal = consistent_normal;
+
+#ifdef SAVE_TEXTURE
+            if (gs.params->saveTexture)
+                gs.pc->points[center].texture4 = consistent_texture4;
+#endif
+
+//            //// Mark corresponding point on other views as "used"
+//            for ( int i = 0; i < camParams.viewSelectionSubsetNumber; i++ ) {
+//                int idxCurr = camParams.viewSelectionSubset[i];
+//                if (used_list[idxCurr].x==-1)
+//                    continue;
+//                //printf("Used list point on camera %d is %d %d\n", idxCurr, used_list[idxCurr].x, used_list[idxCurr].y);
+//                gs.lines[idxCurr].used_pixels [used_list[idxCurr].x + used_list[idxCurr].y*cols] = 1;
+//            }
+        }
+    }
+
+    return;
+}
+
 
 /*
  * Simple and fast depth math fusion based on depth map and normal consensus
@@ -403,7 +616,10 @@ void fusibile_cu(GlobalState &gs, PointCloudList &pc_list, int num_views)
     size_t total;
     cudaMemGetInfo( &avail, &total );
     size_t used = total - avail;
+    printf("Device memory total: %fMB\n", total/1000000.0f);
     printf("Device memory used: %fMB\n", used/1000000.0f);
+    printf("Device memory avail: %fMB\n", avail/1000000.0f);
+
     printf("Number of iterations is %d\n", gs.params->iterations);
     printf("Blocksize is %dx%d\n", gs.params->box_hsize,gs.params->box_vsize);
     printf("Disparity threshold is \t%f\n", gs.params->depthThresh);
@@ -418,7 +634,7 @@ void fusibile_cu(GlobalState &gs, PointCloudList &pc_list, int num_views)
     //printf("Computing final disparity\n");
     //for (int cam=0; cam<10; cam++) {
     for (int cam=0; cam<num_views; cam++) {
-        fusibile<<< grid_size_initrand, block_size_initrand, cam>>>(gs, cam);
+        fusibile2333<<< grid_size_initrand, block_size_initrand, cam>>>(gs, cam);
         cudaDeviceSynchronize();
         copy_point_cloud_to_host(gs, cam, pc_list); // slower but saves memory
         cudaDeviceSynchronize();

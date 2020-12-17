@@ -108,7 +108,10 @@ static void get_subfolders(
 
 static void print_help ()
 {
-    printf ( "\nfusibile\n" );
+    //printf ( "\nfusibile\n" );
+    printf("usage: ./fusibile  -input_folder INPUT_FOLDER  -p_folder CAM_FOLDER  -images_folder IMAGES_FOLDER\n");
+    printf("\t--depth_min=DEPTH_MIN  --depth_max=DEPTH_MAX  --normal_thresh=NORMAL_THRESH\n");
+    printf("\t--disp_thresh=DISP_THRESH  --num_consistent=NUM_CONSISTENT\n");
 }
 
 /* process command line arguments
