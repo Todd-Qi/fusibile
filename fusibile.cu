@@ -192,6 +192,7 @@ __global__ void fusibile2333 (GlobalState &gs, int ref_camera)
     float4 consistent_X = X;
     float4 consistent_normal  = normal_and_depth;
     float4 consistent_texture4 = tex2D<float4> (gs.imgs[ref_camera], p.x+0.5f, p.y+0.5f);
+    float consistent_depth = depth;
     int number_consistent = 0;
     //int2 used_list[camParams.viewSelectionSubsetNumber];
     int2 used_list[MAX_IMAGES];
@@ -254,7 +255,7 @@ __global__ void fusibile2333 (GlobalState &gs, int ref_camera)
                         if (gs.params->saveTexture)
                             consistent_texture4 = consistent_texture4 + tex2D<float4> (gs.imgs[idxCurr], tmp_pt.x+0.5f, tmp_pt.y+0.5f);
 
-
+                        consistent_depth = consistent_depth + reproj_depth;
 
                         // Save the point for later check
                         //printf ("Saved point on camera %d is %d %d\n", idxCurr, (int)tmp_pt.x, (int)tmp_pt.y);
@@ -313,6 +314,10 @@ __global__ void fusibile2333 (GlobalState &gs, int ref_camera)
     consistent_X       = consistent_X       / ((float) number_consistent + 1.0f);
     consistent_normal  = consistent_normal  / ((float) number_consistent + 1.0f);
     consistent_texture4 = consistent_texture4 / ((float) number_consistent + 1.0f);
+    consistent_depth = consistent_depth /  ((float) number_consistent + 1.0f);
+
+    float4 consistent_3Dpoint;
+    get3Dpoint_cu(&consistent_3Dpoint, camParams.cameras[ref_camera], p, consistent_depth);
 
     // If at least numConsistentThresh point agree:
     // Create point
@@ -322,8 +327,9 @@ __global__ void fusibile2333 (GlobalState &gs, int ref_camera)
         //printf("\tEnough consistent points!\nSaving point %f %f %f", consistent_X.x, consistent_X.y, consistent_X.z);
         if (!gs.params->remove_black_background) // hardcoded for middlebury TODO FIX
         {
-            gs.pc->points[center].coord  = consistent_X;
+//            gs.pc->points[center].coord  = consistent_X;
             gs.pc->points[center].normal = consistent_normal;
+            gs.pc->points[center].coord = consistent_3Dpoint;
 
 #ifdef SAVE_TEXTURE
             if (gs.params->saveTexture)
